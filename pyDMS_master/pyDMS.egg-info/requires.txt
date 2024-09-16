@@ -1,0 +1,6 @@
+numpy>=1.10
+gdal>=3.0
+scikit-learn
+scipy
+numba
+pyproj>2.2.0
