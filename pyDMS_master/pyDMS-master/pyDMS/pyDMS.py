@@ -6,6 +6,7 @@ Copyright: (C) 2017, Radoslaw Guzinski
 
 import math
 import os
+from multiprocessing import Pool
 
 import numpy as np
 from osgeo import gdal
@@ -20,7 +21,7 @@ REG_sklearn_ann = 1
 
 
 class DecisionTreeRegressorWithLinearLeafRegression(tree.DecisionTreeRegressor):
-    ''' Decision tree regressor with added linear (bayesian ridge) regression
+    ''' Decision tree regressor with added linear (ridge) regression
     for all the data points falling within each decision tree leaf node.
 
     Parameters
@@ -85,7 +86,7 @@ class DecisionTreeRegressorWithLinearLeafRegression(tree.DecisionTreeRegressor):
         leafValues = np.unique(predictedValues)
         for value in leafValues:
             ind = predictedValues == value
-            leafLinearRegrsion = linear_model.BayesianRidge()
+            leafLinearRegrsion = linear_model.Ridge()
             leafLinearRegrsion.fit(X[ind, :], y[ind])
             self.leafParameters[value] = {"linearRegression": leafLinearRegrsion,
                                           "max": np.max(y[ind]),
@@ -174,14 +175,18 @@ class DecisionTreeSharpener(object):
 
     cvHomogeneityThreshold: float (optional, default: 0)
         A threshold of coeficient of variation below which high-resolution
-        pixels resampled to low-resolution are considered homogeneous and
-        usable during the training of the disaggregator. If threshold is 0 or
+        pixels resampled to low-resolution are considered homogeneous. Non-homogenous pixels
+        get extra penalized during the training of the disaggregator. If threshold is 0 or
         negative then it is set automatically such that 80% of pixels are below
         it.
 
     movingWindowSize: integer (optional, default: 0)
         The size of local regression moving window in low-resolution pixels. If
         set to 0 then only global regression is performed.
+
+    minimumSampleNumber: integer (optional, default: 10)
+        The number of samples requried to train a regression model. Applicable both to local and
+        global regressions.
 
     disaggregatingTemperature: boolean (optional, default: False)
         Flag indicating whether the parameter to be disaggregated is
@@ -221,7 +226,7 @@ class DecisionTreeSharpener(object):
     ----------
     .. [Gao2012] Gao, F., Kustas, W. P., & Anderson, M. C. (2012). A Data
        Mining Approach for Sharpening Thermal Satellite Imagery over Land.
-       Remote Sensing, 4(11), 3287–3319. https://doi.org/10.3390/rs4113287
+       Remote Sensing, 4(11), 3287-3319. https://doi.org/10.3390/rs4113287
     '''
     def __init__(self,
                  highResFiles,
@@ -230,6 +235,7 @@ class DecisionTreeSharpener(object):
                  lowResGoodQualityFlags=[],
                  cvHomogeneityThreshold=0,
                  movingWindowSize=0,
+                 minimumSampleNumber=10,
                  disaggregatingTemperature=False,
                  perLeafLinearRegression=True,
                  linearRegressionExtrapolationRatio=0.25,
@@ -271,6 +277,8 @@ class DecisionTreeSharpener(object):
         # then prediction window size (see section 2.3 of Gao paper)
         self.movingWindowExtension = self.movingWindowSize * 0.25
         self.windowExtents = []
+
+        self.minimumSampleNumber = minimumSampleNumber
 
         self.disaggregatingTemperature = disaggregatingTemperature
 
@@ -381,20 +389,23 @@ class DecisionTreeSharpener(object):
                 qualityPixWindow = qualityPix[rows, cols]
                 resCVWindow = resCV[rows, cols]
 
-                # Good pixels are those where low res data quality is good and
-                # high res data is homonogenous
+                # Good pixels are those where both low and high resolution data exists
+                goodPix = np.logical_and.reduce((qualityPixWindow,
+                                                 resCVWindow > 0,
+                                                 resCVWindow < 1000))
+                # If number of good pixels is below threshold then do not train a model
+                if np.sum(goodPix) < self.minimumSampleNumber:
+                    goodPix = np.zeros(goodPix.shape).astype(bool)
+
                 if self.autoAdjustCvThreshold:
-                    g = np.logical_and.reduce((qualityPixWindow, resCVWindow < 1000,
-                                               resCVWindow > 0))
-                    if ~np.any(g):
+                    if ~np.any(goodPix):
                         self.cvHomogeneityThreshold = 0
                     else:
-                        self.cvHomogeneityThreshold = np.percentile(resCVWindow[g],
+                        self.cvHomogeneityThreshold = np.percentile(resCVWindow[goodPix],
                                                                     self.precentileThreshold)
-                    print('Homogeneity CV threshold: %.2f' % self.cvHomogeneityThreshold)
+                        print('Homogeneity CV threshold: %.2f' % self.cvHomogeneityThreshold)
                 homogenousPix = np.logical_and(resCVWindow < self.cvHomogeneityThreshold,
                                                resCVWindow > 0)
-                goodPix = np.logical_and(homogenousPix, qualityPixWindow)
 
                 goodData_LR[i] = utils.appendNpArray(goodData_LR[i],
                                                      data_LR[rows, cols][goodPix])
@@ -402,16 +413,20 @@ class DecisionTreeSharpener(object):
                                                      resMean[rows, cols, :][goodPix, :], axis=0)
 
                 # Also estimate weight given to each pixel as the inverse of its
-                # heterogeneity
+                # heterogeneity. The most heterogenous (beyond CV treshold) pixels are extra
+                # penalized by having their weight halved.
                 w = 1/resCVWindow[goodPix]
+                if w.size > 1:
+                    w = (w - np.min(w)) / (np.max(w) - np.min(w))
+                    w[~homogenousPix[goodPix]] = w[~homogenousPix[goodPix]] / 2
                 weight[i] = utils.appendNpArray(weight[i], w)
 
                 # Print some stats
-                if np.prod(data_LR[rows, cols][qualityPixWindow].shape) > 0:
-                    percentageUsedPixels = int(float(np.prod(goodData_LR[i].shape)) /
-                                               float(np.prod(data_LR[rows, cols][qualityPixWindow].shape)) * 100)
+                if goodData_LR[i].size > 0:
+                    percentageUsedPixels = int(float(goodData_LR[i].size) /
+                                               float(data_LR[rows, cols][qualityPixWindow].size) * 100)
                     print('Number of training elements for is ' +
-                          str(np.prod(goodData_LR[i].shape)) + ' representing ' +
+                          str(goodData_LR[i].size) + ' representing ' +
                           str(percentageUsedPixels)+'% of avaiable low-resolution data.')
 
             # Close all files
@@ -486,10 +501,13 @@ class DecisionTreeSharpener(object):
         # Temporarly get rid of NaN's
         nanInd = np.isnan(inData)
         inData[nanInd] = 0
-        outWindowData = np.empty((ysize, xsize))*np.nan
 
-        # Do the downscailing on the moving windows if there are any
+        outWindowData = np.empty((ysize, xsize))*np.nan
+        outFullData = np.empty((ysize, xsize))*np.nan
+        # Do the downscailing on the moving windows if there are any and also process the full
+        # scene using the same windows to optimize memory usage
         for i, extent in enumerate(self.windowExtents):
+            print(i)
             if self.reg[i] is not None:
                 [minX, minY] = utils.point2pix(extent[0], gt)  # UL
                 [minX, minY] = [max(minX, 0), max(minY, 0)]
@@ -498,12 +516,13 @@ class DecisionTreeSharpener(object):
                 windowInData = inData[minY:maxY, minX:maxX, :]
                 outWindowData[minY:maxY, minX:maxX] = \
                     self._doPredict(windowInData, self.reg[i])
+                if self.reg[-1] is not None:
+                    outFullData[minY:maxY, minX:maxX] = \
+                        self._doPredict(windowInData, self.reg[-1])
 
-        # Do the downscailing on the whole input image
-        if self.reg[-1] is not None:
+        # If there were no moving windows then do the downscailing on the whole input image
+        if np.all(np.isnan(outFullData)) and self.reg[-1] is not None:
             outFullData = self._doPredict(inData, self.reg[-1])
-        else:
-            outFullData = np.empty((ysize, xsize))*np.nan
 
         # Combine the windowed and whole image regressions
         # If there is no windowed regression just use the whole image regression
@@ -518,21 +537,31 @@ class DecisionTreeSharpener(object):
                                            highResFile.GetProjection(),
                                            "MEM",
                                            noDataValue=np.nan)
-            windowedResidual, _, _ = self._calculateResidual(outWindowScene, lowResScene)
+            windowedResidual_LR, gt_LR = self._calculateResidual(outWindowScene, lowResScene)
             outWindowScene = None
             outFullScene = utils.saveImg(outFullData,
                                          highResFile.GetGeoTransform(),
                                          highResFile.GetProjection(),
                                          "MEM",
                                          noDataValue=np.nan)
-            fullResidual, _, _ = self._calculateResidual(outFullScene, lowResScene)
-            outFullScene = None
+            fullResidual_LR, gt_LR = self._calculateResidual(outFullScene, lowResScene)
             lowResScene = None
             # windowed weight
-            ww = (1/windowedResidual)**2/((1/windowedResidual)**2 + (1/fullResidual)**2)
+            ww_LR = (1/windowedResidual_LR)**2/((1/windowedResidual_LR)**2 +
+                                                (1/fullResidual_LR)**2)
+            wwLowResScene = utils.saveImg(ww_LR,
+                                          gt_LR,
+                                          highResFile.GetProjection(),
+                                          "MEM",
+                                          noDataValue=np.nan)
+            ww = utils.resampleLowResToHighRes(wwLowResScene, outFullScene)
+            ww = np.clip(ww, 0.0, 1.0)
             # full weight
             fw = 1 - ww
-            outData = outWindowData*ww + outFullData*fw
+            if self.disaggregatingTemperature:
+                outData = ((outWindowData**4)*ww + (outFullData**4)*fw)**0.25
+            else:
+                outData = outWindowData*ww + outFullData*fw
         # Otherwised use just windowed regression
         else:
             outData = outWindowData
@@ -597,7 +626,13 @@ class DecisionTreeSharpener(object):
         else:
             quality_LR = None
 
-        residual_HR, residual_LR, gt_res = self._calculateResidual(scene_HR, scene_LR, quality_LR)
+        residual_LR, gt_res = self._calculateResidual(scene_HR, scene_LR, quality_LR)
+        residualImage = utils.saveImg(residual_LR,
+                                      gt_res,
+                                      scene_HR.GetProjection(),
+                                      "MEM",
+                                      noDataValue=np.nan)
+        residual_HR = utils.resampleLowResToHighRes(residualImage, scene_HR)
 
         if self.disaggregatingTemperature:
             if doCorrection:
@@ -611,6 +646,11 @@ class DecisionTreeSharpener(object):
                 correctedImage = None
             # Convert residual back to temperature for easier visualisation
             residual_LR = (residual_LR + 273.15**4)**0.25 - 273.15
+            residualImage = utils.saveImg(residual_LR,
+                                          gt_res,
+                                          scene_HR.GetProjection(),
+                                          "MEM",
+                                          noDataValue=np.nan)
         else:
             if doCorrection:
                 corrected = residual_HR + scene_HR.GetRasterBand(1).ReadAsArray()
@@ -621,12 +661,6 @@ class DecisionTreeSharpener(object):
                                                noDataValue=np.nan)
             else:
                 correctedImage = None
-
-        residualImage = utils.saveImg(residual_LR,
-                                      gt_res,
-                                      scene_HR.GetProjection(),
-                                      "MEM",
-                                      noDataValue=np.nan)
 
         print("LR residual bias: "+str(np.nanmean(residual_LR)))
         print("LR residual RMSD: "+str(np.nanmean(residual_LR**2)**0.5))
@@ -647,7 +681,7 @@ class DecisionTreeSharpener(object):
             self.regressorOpt["max_leaf_nodes"] = 10
         else:
             self.regressorOpt["max_leaf_nodes"] = 30
-        self.regressorOpt["min_samples_leaf"] = 10
+        self.regressorOpt["min_samples_leaf"] = min(self.minimumSampleNumber, 10)
 
         # If per leaf linear regression is used then use modified
         # DecisionTreeRegressor. Otherwise use the standard one.
@@ -726,41 +760,158 @@ class DecisionTreeSharpener(object):
             # Find the residual (difference) between the two
             residual_LR = data_LR - resMean[:, :, 0]
 
-        # Smooth the residual and resample to high resolution
-        residual = utils.binomialSmoother(residual_LR)
-        residualDs = utils.saveImg(residual, subsetScene_LR.GetGeoTransform(),
-                                   subsetScene_LR.GetProjection(), "MEM", noDataValue=np.nan)
-        residualScene_BL = utils.resampleWithGdalWarp(residualDs, downscaledScene,
-                                                      resampleAlg="bilinear")
-        residualDs = None
+        return residual_LR, gt_LR
 
-        residual = residualScene_BL.GetRasterBand(1).ReadAsArray()
-        # Sometimes there can be 1 HR pixel NaN border arond LR invalid pixels due to resampling.
-        # Fuction below fixes this. Image border pixels are excluded due to numba stencil
-        # limitations.
-        residual[1:-1, 1:-1] = utils.removeEdgeNaNs(residual)[1:-1, 1:-1]
-        residualScene_BL = None
 
-        # The residual array might be slightly smaller then the downscaled because
-        # of the subsetting of the low resolution scene. In that case just pad
-        # the missing values with neighbours.
-        downscaled = downscaledScene.GetRasterBand(1).ReadAsArray()
-        if downscaled.shape != residual.shape:
-            temp = np.zeros(downscaled.shape)
-            temp[:residual.shape[0], :residual.shape[1]] = residual
-            temp[residual.shape[0]:, :] = \
-                temp[2*(residual.shape[0] - downscaled.shape[0]):residual.shape[0] - downscaled.shape[0], :]
-            temp[:, residual.shape[1]:] = \
-                temp[:, 2*(residual.shape[1] - downscaled.shape[1]):residual.shape[1] - downscaled.shape[1]]
+class CubistSharpener(DecisionTreeSharpener):
+    ''' Cubist (https://github.com/pjaselin/Cubist#readme) based sharpening (disaggregation) of
+    low-resolution images using high-resolution images. The implementation is mostly based on
+    [Gao2012] as implemented in DescisionTreeSharpener except that Decision Tree regressor is
+    replaced by Cubist regressor as in [Gao2012].
 
-            residual = temp
+    Cubist based regressor is trained with high-resolution data resampled to
+    low resolution and low-resolution data and then applied
+    directly to high-resolution data to obtain high-resolution representation
+    of the low-resolution data.
 
-        residualScene = None
-        subsetScene_LR = None
-        subsetQuality_LR = None
+    The implementation includes selecting training data based on homogeneity
+    statistics and using the homogeneity as weight factor ([Gao2012], section 2.2),
+    performing linear regression with samples located within each Cubist rule ([Gao2012],
+    section 2.1), performing local (moving window) and global regression and
+    combining them based on residuals ([Gao2012] section 2.3) and performing residual
+    analysis and bias correction ([Gao2012], section 2.4)
 
-        return residual, residual_LR, gt_LR
+    Parameters
+    ----------
+    highResFiles: list of strings
+        A list of file paths to high-resolution images to be used during the
+        training of the sharpener.
 
+    lowResFiles: list of strings
+        A list of file paths to low-resolution images to be used during the
+        training of the sharpener. There must be one low-resolution image
+        for each high-resolution image.
+
+    lowResQualityFiles: list of strings (optional, default: [])
+        A list of file paths to low-resolution quality images to be used to
+        mask out low-quality low-resolution pixels during training. If provided
+        there must be one quality image for each low-resolution image.
+
+    lowResGoodQualityFlags: list of integers (optional, default: [])
+        A list of values indicating which pixel values in the low-resolution
+        quality images should be considered as good quality.
+
+    cvHomogeneityThreshold: float (optional, default: 0.25)
+        A threshold of coeficient of variation below which high-resolution
+        pixels resampled to low-resolution are considered homogeneous and
+        usable during the training of the disaggregator.
+
+    movingWindowSize: integer (optional, default: 0)
+        The size of local regression moving window in low-resolution pixels. If
+        set to 0 then only global regression is performed.
+
+    minimumSampleNumber: integer (optional, default: 10)
+        The number of samples requried to train a regression model. Applicable both to local and
+        global regressions.
+
+    disaggregatingTemperature: boolean (optional, default: False)
+        Flag indicating whether the parameter to be disaggregated is
+        temperature (e.g. land surface temperature). If that is the case then
+        at some points it needs to be converted into radiance. This is becasue
+        sensors measure energy, not temperature, plus radiance is the physical
+        measurements it makes sense to average, while radiometric temperature
+        behaviour is not linear.
+
+    n_processes: int (optional, default: 3)
+        Number of parallel processes to use during application of Cubist regression.
+
+    regressorOpt: dictionary (optional, default: {})
+        Options to pass to cubist regressor constructor See
+        https://github.com/pjaselin/Cubist#readme for details.
+
+    baggingRegressorOpt: dictionary (optional, default: {})
+        Not used with Cubist regression.
+
+
+    Returns
+    -------
+    None
+
+
+    References
+    ----------
+    .. [Gao2012] Gao, F., Kustas, W. P., & Anderson, M. C. (2012). A Data
+       Mining Approach for Sharpening Thermal Satellite Imagery over Land.
+       Remote Sensing, 4(11), 3287-3319. https://doi.org/10.3390/rs4113287
+    '''
+
+    def __init__(self,
+                 highResFiles,
+                 lowResFiles,
+                 lowResQualityFiles=[],
+                 lowResGoodQualityFlags=[],
+                 cvHomogeneityThreshold=0.25,
+                 movingWindowSize=0,
+                 disaggregatingTemperature=False,
+                 n_processes=3,
+                 linearRegressionExtrapolationRatio=0.25,
+                 regressorOpt={},
+                 baggingRegressorOpt={}):
+
+        regressorOpt.setdefault("n_committees", 5)
+        regressorOpt.setdefault("composite", True)
+        regressorOpt.setdefault("neighbors", 3)
+        regressorOpt["extrapolation"] = linearRegressionExtrapolationRatio
+
+        super(CubistSharpener, self).__init__(highResFiles,
+                                              lowResFiles,
+                                              lowResQualityFiles,
+                                              lowResGoodQualityFlags,
+                                              cvHomogeneityThreshold,
+                                              movingWindowSize,
+                                              disaggregatingTemperature,
+                                              linearRegressionExtrapolationRatio=linearRegressionExtrapolationRatio,
+                                              regressorOpt=regressorOpt,
+                                              baggingRegressorOpt=baggingRegressorOpt)
+        self.n_processes = n_processes
+
+    def _doFit(self, goodData_LR, goodData_HR, weight, local):
+        ''' Private function. Fits the cubist regression.
+        '''
+
+        # Move the import of cubist here because this library is not easy to
+        # install but this shouldn't prevent the use of other parts of pyDMS.
+        from cubist import Cubist
+
+        # For local regression constrain the number of rules - section 2.3
+        if local:
+            self.regressorOpt["n_rules"] = 5
+        else:
+            self.regressorOpt["n_rules"] = 500
+        reg = Cubist(**self.regressorOpt)
+        reg = reg.fit(goodData_HR, goodData_LR, sample_weight=weight)
+
+        return reg
+
+    def _doPredict(self, inData, reg):
+        ''' Private function. Applies the cubist regression. The free version of cubist does not
+        support native (C) parallelization so we do it in Python.
+        '''
+
+        origShape = inData.shape
+        if len(origShape) == 3:
+            bands = origShape[2]
+        else:
+            bands = 1
+        # Do the actual cubist regression
+        inData = inData.reshape((-1, bands))
+        chunks = np.array_split(inData, self.n_processes)
+        with Pool(processes=self.n_processes) as pool:
+            res_chunks = pool.map(reg.predict, chunks)
+        outData = np.concatenate(res_chunks)
+        outData = outData.reshape((origShape[0], origShape[1]))
+
+        return outData
 
 class NeuralNetworkSharpener(DecisionTreeSharpener):
     ''' Neural Network based sharpening (disaggregation) of low-resolution
@@ -810,6 +961,10 @@ class NeuralNetworkSharpener(DecisionTreeSharpener):
         The size of local regression moving window in low-resolution pixels. If
         set to 0 then only global regression is performed.
 
+    minimumSampleNumber: integer (optional, default: 10)
+        The number of samples requried to train a regression model. Applicable both to local and
+        global regressions.
+
     disaggregatingTemperature: boolean (optional, default: False)
         Flag indicating whether the parameter to be disaggregated is
         temperature (e.g. land surface temperature). If that is the case then
@@ -845,7 +1000,7 @@ class NeuralNetworkSharpener(DecisionTreeSharpener):
     ----------
     .. [Gao2012] Gao, F., Kustas, W. P., & Anderson, M. C. (2012). A Data
        Mining Approach for Sharpening Thermal Satellite Imagery over Land.
-       Remote Sensing, 4(11), 3287–3319. https://doi.org/10.3390/rs4113287
+       Remote Sensing, 4(11), 3287-3319. https://doi.org/10.3390/rs4113287
     '''
 
     def __init__(self,
