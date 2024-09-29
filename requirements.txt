@@ -2,11 +2,10 @@ osgeo
 numpy
 matplotlib
 rasterio
-getpass
 requests
 pandas
 shapely
-json
 geopandas
 sentinelhub
 rioxarray
+numba
