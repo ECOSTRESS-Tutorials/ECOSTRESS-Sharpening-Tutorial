@@ -1,4 +1,4 @@
-osgeo
+gdal
 numpy
 matplotlib
 rasterio
