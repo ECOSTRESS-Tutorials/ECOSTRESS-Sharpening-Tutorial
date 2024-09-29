@@ -14,4 +14,6 @@ These notebooks are a wrap around [pyDMS](https://github.com/radosuav/pyDMS), de
 
 The document called **"Common_sharpening_errors.pdf"** lists bugs/errors you might encounter when using the notebook and some ways to resolve these issues.
 
+Even if there are some steps to ensure that we only downscale clear pixels. I adivse to check how the original granule looked, espicecially if the results is suspicious. It could be due to bad geolocation, unmasked clouds or any other error in the original image.
+
 Questions, suggestions, or remarks: quentindehaene@gmail.com or glynn.hulley@jpl.nasa.gov
