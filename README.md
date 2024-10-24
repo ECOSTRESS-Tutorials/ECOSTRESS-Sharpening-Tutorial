@@ -6,7 +6,7 @@ If you are new with ECOSTRESS imagery and its basic image manipulations such as 
 
 The document called **"Setting_up_for_pyDMS.pdf"** explains the necessary steps to install the software environements and libraries to run the notebooks.
 
-The folder named **"pyDMS_master"** contains the functions and classes necessary for the sharpening. You will have to make sure this is properly installed, as described in **"Setting_up_for_pyDMS.pdf"**. 
+The folder named **"pyDMS_main"** contains the functions and classes necessary for the sharpening. You will have to make sure this is properly installed, as described in **"Setting_up_for_pyDMS.pdf"**. 
 
 Once everything is installed, you'll be able to run both of the notebooks on your computer. **Sharpening_ECOSTRESS_S2.ipynb** will guide you to the downscaling of ECOSTRESS LST that you already have on your computer, whether it is from [AppEEARS](https://appeears.earthdatacloud.nasa.gov/), from [EarthDataSearch](https://search.earthdata.nasa.gov/search) or another source. **Sharpening_ECOSTRESS_S2_API.ipynb** will guide you to the downscaling of ECOSTRESS LST that you will download while running the notebook. You will only have to provide the Start and End dates for the imagery and a bounding box for the area of your choosing.
 

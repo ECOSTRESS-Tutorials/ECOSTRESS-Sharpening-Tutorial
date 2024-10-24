@@ -9,3 +9,4 @@ geopandas
 sentinelhub
 rioxarray
 numba
+python-dotenv
